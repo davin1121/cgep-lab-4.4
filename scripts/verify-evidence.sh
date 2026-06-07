@@ -18,6 +18,12 @@ done
 
 [[ -z "$VAULT" ]] && { echo "Set --vault or EVIDENCE_VAULT env var"; exit 2; }
 
+# Use cosign-windows-amd64 if cosign is not found (Windows install)
+if ! command -v cosign &>/dev/null && command -v cosign-windows-amd64 &>/dev/null; then
+  alias cosign='cosign-windows-amd64'
+  shopt -s expand_aliases
+fi
+
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT; cd "$WORK"
 PREFIX="runs/${RUN_ID}"
 
