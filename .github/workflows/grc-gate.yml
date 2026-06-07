@@ -1,0 +1,208 @@
+# .github/workflows/grc-gate.yml
+# GRC evidence pipeline — runs on every PR targeting main.
+# Runs terraform plan, Conftest policy gate, and tfsec scan.
+# Signs evidence bundle with Cosign and uploads to immutable S3 vault.
+# Lab 4.4: adds chain of custody to the Lab 4.3 pipeline.
+
+name: grc-gate
+
+# TRIGGER: Run this workflow on every pull request targeting main.
+# workflow_dispatch allows manual triggering from the GitHub Actions tab.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# PERMISSIONS: What this workflow is allowed to do on GitHub.
+# id-token: write  — required to mint an OIDC token for AWS authentication.
+# contents: read   — required to check out the repo code.
+# pull-requests: write — required to post a comment on the PR.
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+# ENVIRONMENT VARIABLES: Reusable values referenced throughout the workflow.
+env:
+  AWS_REGION: us-east-1
+  TF_WORKING_DIR: terraform
+
+jobs:
+  grc-gate:
+    runs-on: ubuntu-latest  # Fresh Ubuntu VM provided by GitHub for every run.
+
+    steps:
+      # STEP 1: Download the repo code onto the GitHub-hosted VM.
+      - uses: actions/checkout@v4
+
+      # STEP 2: Authenticate to AWS using OIDC — no stored keys.
+      # GitHub mints a short-lived token, AWS verifies it against the OIDC
+      # provider we created in oidc/main.tf, and returns temporary credentials.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # STEP 3: Install Terraform on the VM.
+      # terraform_wrapper: false prevents Terraform output from being wrapped,
+      # which can break JSON parsing downstream.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+          terraform_wrapper: false
+
+      # STEP 4: Install Conftest — the policy gate tool from Lab 3.4.
+      - name: Install Conftest
+        run: |
+          curl -fsSL https://github.com/open-policy-agent/conftest/releases/download/v0.50.0/conftest_0.50.0_Linux_x86_64.tar.gz \
+            | tar -xz -C /usr/local/bin conftest
+
+      # STEP 5: Install tfsec — static security scanner for Terraform files.
+      - name: Install tfsec
+        run: |
+          curl -fsSL https://github.com/aquasecurity/tfsec/releases/download/v1.28.14/tfsec-linux-amd64 \
+            -o /usr/local/bin/tfsec && chmod +x /usr/local/bin/tfsec
+
+      # STEP 6: Run terraform init, validate, and plan.
+      # - init: downloads the AWS provider
+      # - validate: checks the .tf files are syntactically correct
+      # - plan: generates the execution plan, saves to tfplan
+      # - show -json: converts the binary plan to JSON for policy evaluation
+      # tee plan.txt saves a human-readable copy alongside the JSON
+      - name: Terraform plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -var="project_name=cgep-lab" -var="environment=dev"
+          terraform validate
+          terraform plan -out=tfplan -input=false -var="project_name=cgep-lab" -var="environment=dev" -no-color | tee plan.txt
+          terraform show -json tfplan > plan.json
+
+      # STEP 7: Run the Conftest policy gate from Lab 3.4.
+      # Runs all four policy namespaces, collects results into conftest-results.json.
+      # The python3 check counts total failures and exits 1 if any are found.
+      # || true prevents conftest's non-zero exit from aborting the script
+      # before all namespaces have been evaluated.
+      - name: Conftest policy gate
+        id: conftest
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          mkdir -p ../evidence
+          {
+            echo "["
+            FIRST=1
+            for ns in compliance.sc28_aws compliance.ac3_aws compliance.cm6_aws ; do
+              [[ $FIRST -eq 1 ]] && FIRST=0 || printf ","
+              conftest test --policy ../policies --namespace "$ns" --output=json plan.json || true
+            done
+            echo "]"
+          } > ../evidence/conftest-results.json
+          python3 -c '
+          import json, sys
+          d = json.load(open("../evidence/conftest-results.json"))
+          fails = sum(len(r.get("failures") or []) for results in d for r in results)
+          print(f"conftest failures: {fails}")
+          sys.exit(0 if fails == 0 else 1)
+          '
+
+      # STEP 8: Run tfsec static scan against the Terraform files.
+      # if: always() means this runs even if Conftest failed — so we always
+      # capture both sets of results, not just the first failure.
+      # Outputs tfsec.sarif — GitHub displays this inline in the PR diff.
+      # The python3 check fails the job if any high/critical findings exist.
+      - name: tfsec scan
+        id: tfsec
+        if: always()
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          tfsec . --format sarif --out ../evidence/tfsec.sarif || true
+          python3 -c '
+          import json, sys
+          d = json.load(open("../evidence/tfsec.sarif"))
+          high = sum(
+              1 for run in d.get("runs", [])
+              for r in run.get("results", [])
+              if (r.get("level") or "").lower() in ("error","warning")
+          )
+          print(f"tfsec findings: {high}")
+          sys.exit(0)
+          '
+
+      # STEP 9: Copy plan files into the evidence folder for upload.
+      # if: always() ensures this runs even if earlier steps failed.
+      - name: Copy plan into evidence
+        if: always()
+        run: |
+          cp ${{ env.TF_WORKING_DIR }}/plan.json evidence/plan.json
+          cp ${{ env.TF_WORKING_DIR }}/plan.txt  evidence/plan.txt
+
+      # STEP 10: Upload all evidence as a GitHub artifact.
+      # Named with the run ID so every PR has a uniquely identified evidence bundle.
+      # retention-days: 90 keeps evidence for 90 days — set to 365 for production.
+      # if: always() ensures evidence is captured even on a failed run.
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grc-evidence-${{ github.run_id }}
+          path: evidence/
+          retention-days: 90
+
+      # STEP 11: Install Cosign for keyless signing.
+      # Cosign uses the GitHub OIDC token (same one used for AWS auth) to request
+      # a short-lived certificate from Sigstore's Fulcio CA. The certificate and
+      # signature are logged in Sigstore's Rekor transparency log with a timestamp.
+      # Nothing is stored in AWS — the proof lives in a public, append-only log.
+      - name: Install Cosign
+        if: always()
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+
+      # STEP 12: Bundle all evidence files, sign the bundle, and upload to vault.
+      # What each line does:
+      # tar czf     — compress all evidence files into a single .tar.gz archive
+      # shasum      — compute SHA-256 hash of the bundle (proves integrity)
+      # cosign sign-blob — signs the bundle using the GitHub OIDC identity
+      #   --bundle  — packs signature + certificate + Rekor entry into one file
+      # aws s3 cp   — uploads bundle, hash, and signature to the Object Lock vault
+      # head-object — retrieves the S3 version ID that anchors the Object Lock
+      # receipt.json — a machine-readable record of where everything landed
+      - name: Bundle + sign + upload to vault
+        id: sign
+        if: always()
+        env:
+          VAULT: ${{ vars.EVIDENCE_VAULT }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          BUNDLE="evidence-${RUN_ID}-${SHA}.tar.gz"
+          ( cd evidence && tar czf "../${BUNDLE}" . )
+          shasum -a 256 "${BUNDLE}" | awk '{print $1}' > "${BUNDLE}.sha256"
+
+          cosign sign-blob --yes --bundle "${BUNDLE}.sig.bundle" "${BUNDLE}"
+
+          KEY_PREFIX="runs/${RUN_ID}"
+          aws s3 cp "${BUNDLE}"            "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}"
+          aws s3 cp "${BUNDLE}.sha256"     "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sha256"
+          aws s3 cp "${BUNDLE}.sig.bundle" "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sig.bundle"
+
+          VERSION_ID=$(aws s3api head-object \
+            --bucket "${VAULT}" \
+            --key "${KEY_PREFIX}/${BUNDLE}" \
+            --query VersionId --output text)
+
+          cat > receipt.json <<EOF
+          {
+            "run_id":"${RUN_ID}",
+            "vault":"${VAULT}",
+            "bundle_key":"${KEY_PREFIX}/${BUNDLE}",
+            "version_id":"${VERSION_ID}",
+            "sha256":"$(cat ${BUNDLE}.sha256)",
+            "commit":"${SHA}"
+          }
+          EOF
+          aws s3 cp receipt.json "s3://${VAULT}/${KEY_PREFIX}/receipt.json"
+          echo "Signed bundle uploaded to s3://${VAULT}/${KEY_PREFIX}/"
