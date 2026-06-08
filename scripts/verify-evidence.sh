@@ -18,10 +18,16 @@ done
 
 [[ -z "$VAULT" ]] && { echo "Set --vault or EVIDENCE_VAULT env var"; exit 2; }
 
-# Use cosign-windows-amd64 if cosign is not found (Windows install)
-if ! command -v cosign &>/dev/null && command -v cosign-windows-amd64 &>/dev/null; then
-  alias cosign='cosign-windows-amd64'
-  shopt -s expand_aliases
+# Locate cosign — handles Linux (CI), Windows winget install, and PATH installs
+WINGET_COSIGN="/c/Users/dmart/AppData/Local/Microsoft/WinGet/Packages/Sigstore.Cosign_Microsoft.Winget.Source_8wekyb3d8bbwe/cosign-windows-amd64.exe"
+if ! command -v cosign &>/dev/null; then
+  if command -v cosign-windows-amd64 &>/dev/null; then
+    alias cosign='cosign-windows-amd64'; shopt -s expand_aliases
+  elif [[ -x "$WINGET_COSIGN" ]]; then
+    alias cosign="$WINGET_COSIGN"; shopt -s expand_aliases
+  else
+    echo "cosign not found. Install with: winget install sigstore.cosign"; exit 2
+  fi
 fi
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT; cd "$WORK"
